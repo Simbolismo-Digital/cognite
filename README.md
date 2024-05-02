@@ -1,2 +1,3 @@
 # cognite
-Blog over Artificial Inteligence Studies
+
+Blog de estudos sobre Inteligência Artificial
