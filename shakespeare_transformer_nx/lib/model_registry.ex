@@ -99,7 +99,7 @@ defmodule ShakespeareTransformer.ModelRegistry do
   aleatórios — chame train_model/2 em seguida).
   """
   def new_model(corpus_path, opts \\ []) do
-    vocab_size = Keyword.get(opts, :vocab_size, 600)
+    vocab_size = Keyword.get(opts, :vocab_size, 400)
     d_model    = Keyword.get(opts, :d_model, 48)
     n_heads    = Keyword.get(opts, :n_heads, 2)
     n_blocks   = Keyword.get(opts, :n_blocks, 2)
@@ -155,12 +155,36 @@ defmodule ShakespeareTransformer.ModelRegistry do
   # load_model — carrega um modelo já treinado do disco
   # ---------------------------------------------------------------------------
 
-  @doc "Carrega um %CharacterModel{} previamente salvo (.struct) e registra na ETS."
+  @doc """
+  Carrega um %CharacterModel{} previamente salvo (.struct) e registra
+  na ETS. model, tokenizer e params são todos reconstruídos a partir
+  de dados portáveis — veja save_to_disk/1 pra entender por quê.
+  """
   def load_model(struct_path) do
     character =
       struct_path
       |> File.read!()
       |> :erlang.binary_to_term()
+
+    model =
+      NxModel.build(
+        vocab_size: character.hyperparams.vocab_size,
+        d_model:    character.hyperparams.d_model,
+        n_heads:    character.hyperparams.n_heads,
+        n_blocks:   character.hyperparams.n_blocks,
+        seq_len:    character.hyperparams.seq_len
+      )
+
+    {:ok, tokenizer} = BpeTokenizer.load(character.tokenizer_path)
+
+    params =
+      if File.exists?(character.weights_path) do
+        character.weights_path |> File.read!() |> Nx.deserialize()
+      else
+        Axon.ModelState.empty()
+      end
+
+    character = %CharacterModel{character | model: model, tokenizer: tokenizer, params: params}
 
     put(character)
 
@@ -256,7 +280,7 @@ defmodule ShakespeareTransformer.ModelRegistry do
     seq_len   = character.hyperparams.seq_len
 
     clean = Keyword.get(opts, :clean, true)
-    best  = Keyword.get(opts, :best, nil)
+    best  = Keyword.get(opts, :best, 5)
 
     gen_opts =
       opts
@@ -327,13 +351,36 @@ defmodule ShakespeareTransformer.ModelRegistry do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Salva a struct inteira (arquitetura, pesos, tokenizer, tudo) no
-  struct_path convencionado — um único arquivo binário pra reload rápido.
+  Salva a struct (hiperparâmetros, metadata, paths) no struct_path, e
+  os pesos (params) separadamente via Nx.serialize no weights_path.
+
+  Nem tokenizer, nem params, nem model entram no binário genérico do
+  struct_path: todos os três carregam referências a recursos nativos
+  que não sobrevivem a um restart do BEAM se serializados com
+  :erlang.term_to_binary puro —
+    tokenizer: ponteiro NIF (Rust) pro vocabulário/merges
+    params:    device buffers EXLA (tensores já materializados)
+    model:     o nó de positional_encoding usa Axon.constant/1 com um
+               tensor JÁ CALCULADO (não símbolo) — carrega buffer EXLA
+               junto, mesmo sendo "só a arquitetura"
+
+  model e params são reconstruídos a partir de hyperparams + NxModel.build
+  em load_model/1. tokenizer é reconstruído via BpeTokenizer.load/1.
   """
   def save_to_disk(%CharacterModel{} = character) do
     File.mkdir_p!(Path.dirname(character.struct_path))
-    binary = :erlang.term_to_binary(character)
-    File.write!(character.struct_path, binary)
+
+    # weights_binary = Nx.serialize(character.params)
+    # File.write!(character.weights_path, weights_binary)
+
+    struct_binary =
+      character
+      |> Map.put(:tokenizer, nil)
+      |> Map.put(:params, nil)
+      |> Map.put(:model, nil)
+      |> :erlang.term_to_binary()
+
+    File.write!(character.struct_path, struct_binary)
     character
   end
 
