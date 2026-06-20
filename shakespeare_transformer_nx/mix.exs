@@ -23,7 +23,8 @@ defmodule ShakespeareTransformer.MixProject do
     [
       {:nx, "~> 0.7"},
       {:exla, "~> 0.7"},
-      {:axon, "~> 0.6"}
+      {:axon, "~> 0.6"},
+      {:tokenizers, "~> 0.4"}
     ]
   end
 end

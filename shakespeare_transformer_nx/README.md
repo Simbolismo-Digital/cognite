@@ -150,3 +150,62 @@ IO.puts("Tempo: #{micros / 1_000_000 / 60} min")
 
 NxTrainer.generate(model, params, "To be", c2i, i2c, 200, seq_len: 192)
 
+# BPE Tokenizer
+
+```
+alias ShakespeareTransformer.BpeTokenizer
+
+{:ok, tokenizer} = BpeTokenizer.train("priv/input.txt", vocab_size: 4000)
+BpeTokenizer.save(tokenizer, "priv/bpe_tokenizer.json")
+
+vocab_size = BpeTokenizer.vocab_size(tokenizer)
+IO.puts("vocabulário: #{vocab_size}")
+
+{:ok, ids} = BpeTokenizer.encode(tokenizer, "To be or not to be")
+IO.inspect(ids, label: "ids")
+
+text = BpeTokenizer.decode(tokenizer, ids)
+IO.puts(text)
+```
+
+Train model
+```
+alias ShakespeareTransformer.{BpeTokenizer, NxModel, NxTrainer}
+
+text = File.read!("priv/input.txt")
+{:ok, tokenizer} = BpeTokenizer.load("priv/bpe_tokenizer.json")   # carrega em vez de treinar
+vocab_size = BpeTokenizer.vocab_size(tokenizer)
+
+model = NxModel.build(
+  vocab_size: vocab_size,
+  d_model:    64,
+  n_heads:    4,
+  n_blocks:   3,
+  seq_len:    64
+)
+
+{micros, {model, params}} = :timer.tc(fn ->
+  NxTrainer.train(model, text, tokenizer,
+    seq_len:    64,
+    epochs:     3000,
+    lr:         3.0e-4,
+    batch_size: 32,
+    log_every:  50,
+    save_path:  "priv/nx_model_bpe.axon"
+  )
+end)
+
+IO.puts("Tempo: #{micros / 1_000_000 / 60} min")
+
+NxTrainer.generate(model, params, "To be", tokenizer, nil, 50, seq_len: 64)
+
+Results:
+
+iex(11)> IO.puts("Tempo: #{micros / 1_000_000 / 60} min")
+Tempo: 9.41214165 min
+:ok
+iex(12)> 
+nil
+iex(13)> NxTrainer.generate(model, params, "To be", tokenizer, nil, 50, seq_len: 64)
+"To be\nThat slanderss weightly unwatterment-place.\n\nKING HENRY VIORDLACASA:\nMear the sovereor on me!\nDYou would we will tell it so been:\nTake it do"
+```

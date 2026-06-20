@@ -34,7 +34,7 @@ defmodule ShakespeareTransformer.NxTrainer do
     NxTrainer.generate(trained_model, trained_params, "To be", c2i, i2c, 200)
   """
 
-  alias ShakespeareTransformer.Tokenizer
+  alias ShakespeareTransformer.{Tokenizer, BpeTokenizer}
 
   # ---------------------------------------------------------------------------
   # Preparação dos dados em batches
@@ -73,12 +73,16 @@ defmodule ShakespeareTransformer.NxTrainer do
   @doc """
   Treina o modelo.
 
+  vocabulary: pode ser
+    - um char_to_idx map (tokenizador char-level original), ou
+    - um %Tokenizers.Tokenizer{} (BPE) — detectado automaticamente
+
   opts:
     vocab_size, seq_len, epochs, lr, batch_size, log_every, save_every, save_path,
     initial_params — passe um Axon.ModelState (de NxTrainer.load_params/1)
                      pra continuar treino de onde parou. Se omitido, começa do zero.
   """
-  def train(model, text, char_to_idx, opts \\ []) do
+  def train(model, text, vocabulary, opts \\ []) do
     seq_len        = Keyword.fetch!(opts, :seq_len)
     epochs         = Keyword.get(opts, :epochs,     1000)
     lr             = Keyword.get(opts, :lr,         1.0e-3)
@@ -88,11 +92,11 @@ defmodule ShakespeareTransformer.NxTrainer do
     save_path      = Keyword.get(opts, :save_path,  "priv/nx_model.axon")
     initial_params = Keyword.get(opts, :initial_params, load_or_empty(save_path))
 
-    all_tokens = Tokenizer.encode(text, char_to_idx)
+    all_tokens = encode_text(text, vocabulary)
     tokens_tensor = Nx.tensor(all_tokens, type: :s64)
     total = length(all_tokens)
 
-    IO.puts("Iniciando treino Nx — #{total} tokens, seq_len=#{seq_len}, batch_size=#{batch_size}, lr=#{lr}, now=#{DateTime.utc_now() |> DateTime.to_iso8601()}")
+    IO.puts("Iniciando treino Nx — #{total} tokens, seq_len=#{seq_len}, batch_size=#{batch_size}, lr=#{lr}")
 
     loss_fn = fn y_true, y_pred ->
       vocab = Nx.axis_size(y_pred, -1)
@@ -112,12 +116,12 @@ defmodule ShakespeareTransformer.NxTrainer do
       model
       |> Axon.Loop.trainer(loss_fn, optimizer, log: 0)
       |> Axon.Loop.log(
-        fn state -> "epoch #{state.epoch}, batch #{state.iteration}, loss #{:io_lib.format("~.4f", [Nx.to_number(state.step_state.loss)])}\n" end,
+        fn state -> "epoch #{state.epoch}, batch #{state.iteration}, loss #{:io_lib.format("~.4f", [Nx.to_number(state.step_state.loss)])}, now=#{DateTime.utc_now() |> DateTime.to_iso8601()}\n" end,
         event: :iteration_completed,
         filter: [every: log_every]
       )
       |> Axon.Loop.handle_event(:iteration_completed, fn state ->
-        iteration = state.iteration + 1
+        iteration = state.iteration
 
         if save_every && rem(iteration, save_every) == 0 do
           binary = Nx.serialize(state.step_state[:model_state] || state.step_state)
@@ -154,14 +158,17 @@ defmodule ShakespeareTransformer.NxTrainer do
 
   @doc """
   Gera texto autorregressivo a partir de um prompt.
+
+  vocabulary: char_to_idx map (char-level) ou %Tokenizers.Tokenizer{} (BPE) —
+  mesmo objeto passado no train/4. Pra char-level, também precisa de idx_to_char.
   """
-  def generate(model, params, prompt, char_to_idx, idx_to_char, n_tokens, opts \\ []) do
+  def generate(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, opts \\ []) do
     seq_len     = Keyword.fetch!(opts, :seq_len)
     temperature = Keyword.get(opts, :temperature, 1.0)
 
     {_init_fn, predict_fn} = Axon.build(model, compiler: EXLA)
 
-    initial_tokens = Tokenizer.encode(prompt, char_to_idx)
+    initial_tokens = encode_text(prompt, vocabulary)
 
     final_tokens =
       Enum.reduce(1..n_tokens, initial_tokens, fn _, tokens ->
@@ -190,7 +197,28 @@ defmodule ShakespeareTransformer.NxTrainer do
       end)
 
     generated = Enum.drop(final_tokens, length(initial_tokens))
-    prompt <> Tokenizer.decode(generated, idx_to_char)
+    prompt <> decode_tokens(generated, vocabulary, idx_to_char_or_nil)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Despacho de tokenização — char-level (map) vs BPE (Tokenizers.Tokenizer)
+  # ---------------------------------------------------------------------------
+
+  defp encode_text(text, %Tokenizers.Tokenizer{} = tokenizer) do
+    {:ok, ids} = BpeTokenizer.encode(tokenizer, text)
+    ids
+  end
+
+  defp encode_text(text, char_to_idx) when is_map(char_to_idx) do
+    Tokenizer.encode(text, char_to_idx)
+  end
+
+  defp decode_tokens(ids, %Tokenizers.Tokenizer{} = tokenizer, _idx_to_char) do
+    BpeTokenizer.decode(tokenizer, ids)
+  end
+
+  defp decode_tokens(ids, char_to_idx, idx_to_char) when is_map(char_to_idx) do
+    Tokenizer.decode(ids, idx_to_char)
   end
 
   defp left_pad_or_trim(tokens, seq_len) do
