@@ -117,3 +117,36 @@ iex(14)>
 nil
 iex(15)> NxTrainer.generate(model, params, "To be", c2i, i2c, 200, seq_len: 128)
 "To best no ENCE:\nForort ale arvest yere.\n\nKANTIOUS:\nNo, your nenot toortould, the own deit,\nAnd he king Duard site do\nder at hat nother affors. Gozentem lold,\nAnd fail I dor, fave foule sirok do frecics:\nS"
+
+
+## Results 2
+
+alias ShakespeareTransformer.{Tokenizer, NxModel, NxTrainer}
+
+text = File.read!("priv/input.txt")
+{_chars, c2i, i2c} = Tokenizer.build_vocab(text)
+vocab_size = map_size(c2i)
+
+model = NxModel.build(
+  vocab_size: vocab_size,
+  d_model:    64,
+  n_heads:    4,
+  n_blocks:   3,
+  seq_len:    192
+)
+
+{micros, {model, params}} = :timer.tc(fn ->
+  NxTrainer.train(model, text, c2i,
+    seq_len:    192,
+    epochs:     3000,
+    lr:         3.0e-4,
+    batch_size: 48,
+    log_every:  200,
+    save_path:  "priv/nx_model_2.axon"
+  )
+end)
+
+IO.puts("Tempo: #{micros / 1_000_000 / 60} min")
+
+NxTrainer.generate(model, params, "To be", c2i, i2c, 200, seq_len: 192)
+

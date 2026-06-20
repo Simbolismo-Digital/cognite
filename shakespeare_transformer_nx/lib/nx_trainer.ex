@@ -92,7 +92,7 @@ defmodule ShakespeareTransformer.NxTrainer do
     tokens_tensor = Nx.tensor(all_tokens, type: :s64)
     total = length(all_tokens)
 
-    IO.puts("Iniciando treino Nx — #{total} tokens, seq_len=#{seq_len}, batch_size=#{batch_size}, lr=#{lr}")
+    IO.puts("Iniciando treino Nx — #{total} tokens, seq_len=#{seq_len}, batch_size=#{batch_size}, lr=#{lr}, now=#{DateTime.utc_now() |> DateTime.to_iso8601()}")
 
     loss_fn = fn y_true, y_pred ->
       vocab = Nx.axis_size(y_pred, -1)
