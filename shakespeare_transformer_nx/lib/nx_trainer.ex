@@ -31,7 +31,9 @@ defmodule ShakespeareTransformer.NxTrainer do
         batch_size: 32
       )
 
-    NxTrainer.generate(trained_model, trained_params, "To be", c2i, i2c, 200)
+    NxTrainer.generate(trained_model, trained_params, "To be", c2i, i2c, 200,
+      seq_len: 128, temperature: 0.8, top_k: 10
+    )
   """
 
   alias ShakespeareTransformer.{Tokenizer, BpeTokenizer}
@@ -161,10 +163,18 @@ defmodule ShakespeareTransformer.NxTrainer do
 
   vocabulary: char_to_idx map (char-level) ou %Tokenizers.Tokenizer{} (BPE) —
   mesmo objeto passado no train/4. Pra char-level, também precisa de idx_to_char.
+
+  opts:
+    seq_len      — obrigatório, mesmo usado no treino
+    temperature  — default 1.0. < 1.0 = mais conservador, > 1.0 = mais criativo/ruidoso
+    top_k        — default nil (desativado). Quando definido, restringe a amostragem
+                   aos k tokens mais prováveis a cada passo, cortando a cauda de
+                   tokens raros/mal calibrados que geram ruído tipo fragmentos quebrados.
   """
   def generate(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, opts \\ []) do
     seq_len     = Keyword.fetch!(opts, :seq_len)
     temperature = Keyword.get(opts, :temperature, 1.0)
+    top_k       = Keyword.get(opts, :top_k, nil)
 
     {_init_fn, predict_fn} = Axon.build(model, compiler: EXLA)
 
@@ -191,13 +201,112 @@ defmodule ShakespeareTransformer.NxTrainer do
           |> Nx.divide(temperature)
 
         probs = Axon.Activations.softmax(last_logits)
-        next_token = sample(probs)
+        next_token = sample(probs, top_k)
 
         tokens ++ [next_token]
       end)
 
     generated = Enum.drop(final_tokens, length(initial_tokens))
     prompt <> decode_tokens(generated, vocabulary, idx_to_char_or_nil)
+  end
+
+  @doc """
+  Corta o texto no último ponto final/exclamação/interrogação completo,
+  descartando qualquer fragmento de frase incompleta no final.
+
+  Se nenhuma pontuação final for encontrada, retorna o texto original
+  (evita devolver string vazia).
+  """
+  def truncate_to_last_sentence(text) do
+    case Regex.scan(~r/.*?[.!?]/s, text) do
+      [] -> text
+      matches ->
+        matches
+        |> Enum.map(fn [m] -> m end)
+        |> Enum.join("")
+        |> String.trim()
+    end
+  end
+
+  @doc """
+  Gera múltiplas tentativas via generate_clean/7 e retorna a "melhor",
+  segundo uma heurística simples: menos palavras suspeitas (curtas
+  demais, consoantes demais seguidas, ou fragmento de BPE malformado).
+
+  Não é garantia de qualidade — é uma forma barata de descartar as
+  piores tentativas sem precisar de outro modelo avaliador.
+
+  opts: mesmas de generate_clean/7, mais:
+    attempts — quantas gerações tentar (default 5)
+  """
+  def generate_best(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, opts \\ []) do
+    attempts = Keyword.get(opts, :attempts, 5)
+    gen_opts = Keyword.drop(opts, [:attempts])
+
+    1..attempts
+    |> Enum.map(fn _ ->
+      generate_clean(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, gen_opts)
+    end)
+    |> Enum.max_by(&text_quality_score/1)
+  end
+
+  @doc """
+  Heurística simples de qualidade de texto gerado.
+  Maior é melhor. Pune:
+    - palavras muito curtas isoladas (fragmentos)
+    - sequências longas de consoantes (artefatos do BPE)
+    - poucas palavras totais (geração vazia/cortada)
+  """
+  def text_quality_score(text) do
+    words = text |> String.split(~r/\s+/, trim: true)
+    n_words = length(words)
+
+    if n_words == 0 do
+      -1000.0
+    else
+      suspicious =
+        Enum.count(words, fn w ->
+          clean = String.replace(w, ~r/[^\p{L}]/u, "")
+
+          String.length(clean) <= 1 or
+            Regex.match?(~r/[^aeiouAEIOU\s]{5,}/, clean)
+        end)
+
+      ratio_ok = 1.0 - suspicious / n_words
+      ratio_ok * 100 + n_words * 0.1
+    end
+  end
+
+  @doc """
+  Gera texto e descarta qualquer fragmento de frase incompleta no final.
+
+  Por padrão retorna TODAS as sentenças completas geradas (corta só o
+  fragmento final incompleto). Passe :sentences pra limitar a um número
+  específico de sentenças.
+
+  Útil pra modelos pequenos/corpus pequenos, onde a qualidade degrada
+  conforme a geração avança. Aceita as mesmas opts de generate/7, mais:
+    sentences — default nil (todas). Se inteiro, pega só as N primeiras.
+  """
+  def generate_clean(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, opts \\ []) do
+    sentences = Keyword.get(opts, :sentences, nil)
+    gen_opts  = Keyword.drop(opts, [:sentences])
+
+    full_text = generate(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, gen_opts)
+
+    cleaned = truncate_to_last_sentence(full_text)
+
+    case sentences do
+      nil ->
+        String.trim(cleaned)
+
+      n ->
+        cleaned
+        |> String.split(~r/(?<=[.!?])\s+/)
+        |> Enum.take(n)
+        |> Enum.join(" ")
+        |> String.trim()
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -232,13 +341,36 @@ defmodule ShakespeareTransformer.NxTrainer do
     end
   end
 
-  defp sample(probs) do
+  # ---------------------------------------------------------------------------
+  # Sampling — com suporte opcional a top_k
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Amostra um token a partir da distribuição de probabilidades.
+
+  top_k: quando nil (default), amostra sobre toda a distribuição.
+         quando inteiro, restringe a amostragem aos k tokens mais
+         prováveis, renormalizando as probabilidades só entre eles —
+         elimina a cauda de tokens raros que tendem a gerar ruído.
+  """
+  def sample(probs, top_k \\ nil) do
     probs_list = Nx.to_flat_list(probs)
-    r = :rand.uniform()
+    indexed    = Enum.with_index(probs_list)
+
+    candidates =
+      if top_k do
+        indexed
+        |> Enum.sort_by(fn {p, _i} -> p end, :desc)
+        |> Enum.take(top_k)
+      else
+        indexed
+      end
+
+    total = candidates |> Enum.map(fn {p, _i} -> p end) |> Enum.sum()
+    r = :rand.uniform() * total
 
     {idx, _} =
-      probs_list
-      |> Enum.with_index()
+      candidates
       |> Enum.reduce_while({0, 0.0}, fn {p, i}, {_, cum} ->
         new_cum = cum + p
         if new_cum >= r, do: {:halt, {i, new_cum}}, else: {:cont, {i, new_cum}}
