@@ -2,37 +2,30 @@ defmodule ShakespeareTransformer.NxTrainer do
   @moduledoc """
   Loop de treino e geração usando Nx + Axon.
 
-  Mesma arquitetura, mesmos hiperparâmetros que a versão Elixir puro —
-  só o substrato muda. Onde antes você tinha listas e loops manuais,
-  agora tem tensores e Nx.Defn compilando pra CPU via EXLA.
+  A garantia de "só palavras do corpus" vem do tokenizer agora
+  (mode: :word em BpeTokenizer), não de filtro pós-geração — se o
+  tokenizer é word-level, o modelo fisicamente não tem como escolher
+  um token que não existia no vocabulário de treino.
 
   Uso:
 
-    alias ShakespeareTransformer.{Tokenizer, NxModel, NxTrainer}
+    alias ShakespeareTransformer.{BpeTokenizer, NxModel, NxTrainer}
 
     text = File.read!("priv/input.txt")
-    {_chars, c2i, i2c} = Tokenizer.build_vocab(text)
-    vocab_size = map_size(c2i)
+    {:ok, tokenizer} = BpeTokenizer.train("priv/input.txt", mode: :word)
+    vocab_size = BpeTokenizer.vocab_size(tokenizer)
 
     model = NxModel.build(
-      vocab_size: vocab_size,
-      d_model:    32,
-      n_heads:    2,
-      n_blocks:   2,
-      seq_len:    128
+      vocab_size: vocab_size, d_model: 48, n_heads: 2, n_blocks: 2, seq_len: 48
     )
 
-    {trained_model, trained_params} =
-      NxTrainer.train(model, text, c2i,
-        vocab_size: vocab_size,
-        seq_len:    128,
-        epochs:     3000,
-        lr:         1.0e-3,
-        batch_size: 32
+    {model, params} =
+      NxTrainer.train(model, text, tokenizer,
+        seq_len: 48, epochs: 3000, lr: 3.0e-4, batch_size: 16
       )
 
-    NxTrainer.generate(trained_model, trained_params, "To be", c2i, i2c, 200,
-      seq_len: 128, temperature: 0.8, top_k: 10
+    NxTrainer.generate(model, params, "Welcome", tokenizer, nil, 30,
+      seq_len: 48, temperature: 0.7, top_k: 10
     )
   """
 
@@ -53,8 +46,6 @@ defmodule ShakespeareTransformer.NxTrainer do
     max_start = total - seq_len - 1
     starts = for _ <- 1..batch_size, do: :rand.uniform(max_start) - 1
 
-    # constrói índices [batch_size, seq_len+1] e usa gather —
-    # evita Nx.slice com offset dinâmico, que força recompilação por valor
     idx_matrix =
       starts
       |> Enum.map(fn start -> Enum.to_list(start..(start + seq_len)) end)
@@ -77,10 +68,10 @@ defmodule ShakespeareTransformer.NxTrainer do
 
   vocabulary: pode ser
     - um char_to_idx map (tokenizador char-level original), ou
-    - um %Tokenizers.Tokenizer{} (BPE) — detectado automaticamente
+    - um %Tokenizers.Tokenizer{} (BPE ou word-level) — detectado automaticamente
 
   opts:
-    vocab_size, seq_len, epochs, lr, batch_size, log_every, save_every, save_path,
+    seq_len, epochs, lr, batch_size, log_every, save_every, save_path,
     initial_params — passe um Axon.ModelState (de NxTrainer.load_params/1)
                      pra continuar treino de onde parou. Se omitido, começa do zero.
   """
@@ -133,7 +124,6 @@ defmodule ShakespeareTransformer.NxTrainer do
         {:continue, state}
       end)
 
-    # gera um stream de batches aleatórios
     data_stream =
       Stream.repeatedly(fn ->
         random_batch(tokens_tensor, total, seq_len, batch_size)
@@ -161,15 +151,15 @@ defmodule ShakespeareTransformer.NxTrainer do
   @doc """
   Gera texto autorregressivo a partir de um prompt.
 
-  vocabulary: char_to_idx map (char-level) ou %Tokenizers.Tokenizer{} (BPE) —
-  mesmo objeto passado no train/4. Pra char-level, também precisa de idx_to_char.
+  vocabulary: char_to_idx map (char-level) ou %Tokenizers.Tokenizer{}
+  (BPE ou word-level) — mesmo objeto passado no train/4. Pra char-level,
+  também precisa de idx_to_char.
 
   opts:
     seq_len      — obrigatório, mesmo usado no treino
-    temperature  — default 1.0. < 1.0 = mais conservador, > 1.0 = mais criativo/ruidoso
-    top_k        — default nil (desativado). Quando definido, restringe a amostragem
-                   aos k tokens mais prováveis a cada passo, cortando a cauda de
-                   tokens raros/mal calibrados que geram ruído tipo fragmentos quebrados.
+    temperature  — default 1.0. < 1.0 = mais conservador, > 1.0 = mais criativo
+    top_k        — default nil. Quando definido, restringe a amostragem
+                   aos k tokens mais prováveis a cada passo.
   """
   def generate(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, opts \\ []) do
     seq_len     = Keyword.fetch!(opts, :seq_len)
@@ -182,8 +172,6 @@ defmodule ShakespeareTransformer.NxTrainer do
 
     final_tokens =
       Enum.reduce(1..n_tokens, initial_tokens, fn _, tokens ->
-        # left-padding: mantém a última posição sempre fixa em seq_len - 1,
-        # evitando recompilação por offset dinâmico no slice
         context = left_pad_or_trim(tokens, seq_len)
 
         input_tensor =
@@ -193,7 +181,6 @@ defmodule ShakespeareTransformer.NxTrainer do
 
         logits = predict_fn.(params, %{"tokens" => input_tensor})
 
-        # última posição é sempre seq_len - 1, fixo — sem recompilação
         last_logits =
           logits
           |> Nx.slice([0, seq_len - 1, 0], [1, 1, Nx.axis_size(logits, -1)])
@@ -213,9 +200,6 @@ defmodule ShakespeareTransformer.NxTrainer do
   @doc """
   Corta o texto no último ponto final/exclamação/interrogação completo,
   descartando qualquer fragmento de frase incompleta no final.
-
-  Se nenhuma pontuação final for encontrada, retorna o texto original
-  (evita devolver string vazia).
   """
   def truncate_to_last_sentence(text) do
     case Regex.scan(~r/.*?[.!?]/s, text) do
@@ -229,64 +213,10 @@ defmodule ShakespeareTransformer.NxTrainer do
   end
 
   @doc """
-  Gera múltiplas tentativas via generate_clean/7 e retorna a "melhor",
-  segundo uma heurística simples: menos palavras suspeitas (curtas
-  demais, consoantes demais seguidas, ou fragmento de BPE malformado).
-
-  Não é garantia de qualidade — é uma forma barata de descartar as
-  piores tentativas sem precisar de outro modelo avaliador.
-
-  opts: mesmas de generate_clean/7, mais:
-    attempts — quantas gerações tentar (default 5)
-  """
-  def generate_best(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, opts \\ []) do
-    attempts = Keyword.get(opts, :attempts, 5)
-    gen_opts = Keyword.drop(opts, [:attempts])
-
-    1..attempts
-    |> Enum.map(fn _ ->
-      generate_clean(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, gen_opts)
-    end)
-    |> Enum.max_by(&text_quality_score/1)
-  end
-
-  @doc """
-  Heurística simples de qualidade de texto gerado.
-  Maior é melhor. Pune:
-    - palavras muito curtas isoladas (fragmentos)
-    - sequências longas de consoantes (artefatos do BPE)
-    - poucas palavras totais (geração vazia/cortada)
-  """
-  def text_quality_score(text) do
-    words = text |> String.split(~r/\s+/, trim: true)
-    n_words = length(words)
-
-    if n_words == 0 do
-      -1000.0
-    else
-      suspicious =
-        Enum.count(words, fn w ->
-          clean = String.replace(w, ~r/[^\p{L}]/u, "")
-
-          String.length(clean) <= 1 or
-            Regex.match?(~r/[^aeiouAEIOU\s]{5,}/, clean)
-        end)
-
-      ratio_ok = 1.0 - suspicious / n_words
-      ratio_ok * 100 + n_words * 0.1
-    end
-  end
-
-  @doc """
   Gera texto e descarta qualquer fragmento de frase incompleta no final.
 
-  Por padrão retorna TODAS as sentenças completas geradas (corta só o
-  fragmento final incompleto). Passe :sentences pra limitar a um número
-  específico de sentenças.
-
-  Útil pra modelos pequenos/corpus pequenos, onde a qualidade degrada
-  conforme a geração avança. Aceita as mesmas opts de generate/7, mais:
-    sentences — default nil (todas). Se inteiro, pega só as N primeiras.
+  Por padrão retorna TODAS as sentenças completas geradas. Passe
+  :sentences pra limitar a um número específico.
   """
   def generate_clean(model, params, prompt, vocabulary, idx_to_char_or_nil, n_tokens, opts \\ []) do
     sentences = Keyword.get(opts, :sentences, nil)
@@ -310,7 +240,7 @@ defmodule ShakespeareTransformer.NxTrainer do
   end
 
   # ---------------------------------------------------------------------------
-  # Despacho de tokenização — char-level (map) vs BPE (Tokenizers.Tokenizer)
+  # Despacho de tokenização — char-level (map) vs Tokenizers (BPE ou word-level)
   # ---------------------------------------------------------------------------
 
   defp encode_text(text, %Tokenizers.Tokenizer{} = tokenizer) do
@@ -350,8 +280,7 @@ defmodule ShakespeareTransformer.NxTrainer do
 
   top_k: quando nil (default), amostra sobre toda a distribuição.
          quando inteiro, restringe a amostragem aos k tokens mais
-         prováveis, renormalizando as probabilidades só entre eles —
-         elimina a cauda de tokens raros que tendem a gerar ruído.
+         prováveis, renormalizando as probabilidades só entre eles.
   """
   def sample(probs, top_k \\ nil) do
     probs_list = Nx.to_flat_list(probs)

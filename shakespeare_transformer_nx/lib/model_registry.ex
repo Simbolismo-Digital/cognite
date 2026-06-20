@@ -25,10 +25,6 @@ defmodule ShakespeareTransformer.ModelRegistry do
 
   # ---------------------------------------------------------------------------
   # GenServer — entra na árvore de supervisão como child de verdade.
-  # A tabela ETS em si é :public, então o resto do código continua
-  # lendo/escrevendo direto nela sem precisar passar por mensagem —
-  # o GenServer só existe pra ter um dono supervisionado e rodar o
-  # autoload de forma assíncrona no boot, sem travar a inicialização.
   # ---------------------------------------------------------------------------
 
   def start_link(opts \\ []) do
@@ -45,7 +41,6 @@ defmodule ShakespeareTransformer.ModelRegistry do
     autoload_dir = Keyword.get(opts, :autoload_dir, System.get_env("SHAKESPEARE_AUTOLOAD_DIR"))
 
     if autoload_dir do
-      # roda fora do init pra não travar o boot caso haja muitos/grandes modelos
       send(self(), {:autoload, autoload_dir})
     end
 
@@ -72,7 +67,7 @@ defmodule ShakespeareTransformer.ModelRegistry do
   @doc "Gera os paths convencionados a partir do diretório e id."
   def conventional_paths(dir, id) do
     %{
-      tokenizer: Path.join(dir, "#{id}_bpe_tokenizer.json"),
+      tokenizer: Path.join(dir, "#{id}_tokenizer.json"),
       weights:   Path.join(dir, "nx_model_#{id}.axon"),
       struct:    Path.join(dir, "#{id}.struct")
     }
@@ -87,9 +82,10 @@ defmodule ShakespeareTransformer.ModelRegistry do
   O id é derivado automaticamente do nome do arquivo, e os paths
   de tokenizer/pesos/struct seguem a convenção do diretório do corpus.
 
-  opts (todas opcionais, com defaults calibrados pro tipo de corpus
-  pequeno/repetitivo usado no Grik):
-    vocab_size — default 600
+  opts (todas opcionais):
+    mode       — :bpe (default) ou :word. Veja BpeTokenizer moduledoc
+                 pra entender o trade-off entre os dois.
+    vocab_size — default 400. Só relevante pra mode: :bpe.
     d_model    — default 48
     n_heads    — default 2
     n_blocks   — default 2
@@ -99,6 +95,7 @@ defmodule ShakespeareTransformer.ModelRegistry do
   aleatórios — chame train_model/2 em seguida).
   """
   def new_model(corpus_path, opts \\ []) do
+    mode       = Keyword.get(opts, :mode, :word)
     vocab_size = Keyword.get(opts, :vocab_size, 400)
     d_model    = Keyword.get(opts, :d_model, 48)
     n_heads    = Keyword.get(opts, :n_heads, 2)
@@ -109,7 +106,7 @@ defmodule ShakespeareTransformer.ModelRegistry do
     dir = Path.dirname(corpus_path)
     paths = conventional_paths(dir, id)
 
-    {:ok, tokenizer} = BpeTokenizer.train(corpus_path, vocab_size: vocab_size)
+    {:ok, tokenizer} = BpeTokenizer.train(corpus_path, mode: mode, vocab_size: vocab_size)
     BpeTokenizer.save(tokenizer, paths.tokenizer)
     real_vocab_size = BpeTokenizer.vocab_size(tokenizer)
 
@@ -133,7 +130,8 @@ defmodule ShakespeareTransformer.ModelRegistry do
         d_model:    d_model,
         n_heads:    n_heads,
         n_blocks:   n_blocks,
-        seq_len:    seq_len
+        seq_len:    seq_len,
+        tokenizer_mode: mode
       },
       corpus_path: corpus_path,
       tokenizer_path: paths.tokenizer,
@@ -197,14 +195,9 @@ defmodule ShakespeareTransformer.ModelRegistry do
   Varre um diretório (ou padrão glob) procurando arquivos `*.struct`
   e carrega todos em paralelo, registrando cada um na ETS.
 
-  Aceita tanto um diretório simples quanto um padrão glob explícito:
-
       autoload_dir("priv/kobold")        # varre só priv/kobold/*.struct
       autoload_dir("priv/*")             # varre priv/<qualquer_pasta>/*.struct
       autoload_dir("priv/**")            # varre recursivamente
-
-  Essa é a forma "automágica" de subir o elenco inteiro no boot —
-  basta apontar pra onde os personagens vivem, sem listar arquivo a arquivo.
   """
   def autoload_dir(pattern) do
     struct_files =
@@ -239,10 +232,12 @@ defmodule ShakespeareTransformer.ModelRegistry do
     character = fetch!(id)
     text = File.read!(character.corpus_path)
 
+    tmp_save_path = character.weights_path <> ".tmp"
+
     train_opts =
       opts
       |> Keyword.put_new(:seq_len, character.hyperparams.seq_len)
-      |> Keyword.put(:save_path, character.weights_path)
+      |> Keyword.put(:save_path, tmp_save_path)
       |> Keyword.put(:initial_params, character.params)
 
     {model, new_params} = NxTrainer.train(character.model, text, character.tokenizer, train_opts)
@@ -261,6 +256,7 @@ defmodule ShakespeareTransformer.ModelRegistry do
 
     put(updated)
     save_to_disk(updated)
+    File.rm(tmp_save_path)
     updated
   end
 
@@ -273,41 +269,30 @@ defmodule ShakespeareTransformer.ModelRegistry do
 
   opts: as mesmas de NxTrainer.generate/7 (temperature, top_k), mais:
     clean — se true (default), usa generate_clean (corta frase incompleta final)
-    best  — se inteiro N, usa generate_best com N tentativas, escolhendo a melhor
   """
   def model_generate(id, prompt, n_tokens, opts \\ []) do
     character = fetch!(id)
     seq_len   = character.hyperparams.seq_len
 
     clean = Keyword.get(opts, :clean, true)
-    best  = Keyword.get(opts, :best, 5)
 
     gen_opts =
       opts
-      |> Keyword.drop([:clean, :best])
+      |> Keyword.drop([:clean])
       |> Keyword.put(:seq_len, seq_len)
 
-    cond do
-      best ->
-        NxTrainer.generate_best(
-          character.model, character.params, prompt,
-          character.tokenizer, character.idx_to_char, n_tokens,
-          Keyword.put(gen_opts, :attempts, best)
-        )
-
-      clean ->
-        NxTrainer.generate_clean(
-          character.model, character.params, prompt,
-          character.tokenizer, character.idx_to_char, n_tokens,
-          gen_opts
-        )
-
-      true ->
-        NxTrainer.generate(
-          character.model, character.params, prompt,
-          character.tokenizer, character.idx_to_char, n_tokens,
-          gen_opts
-        )
+    if clean do
+      NxTrainer.generate_clean(
+        character.model, character.params, prompt,
+        character.tokenizer, character.idx_to_char, n_tokens,
+        gen_opts
+      )
+    else
+      NxTrainer.generate(
+        character.model, character.params, prompt,
+        character.tokenizer, character.idx_to_char, n_tokens,
+        gen_opts
+      )
     end
   end
 
@@ -357,21 +342,13 @@ defmodule ShakespeareTransformer.ModelRegistry do
   Nem tokenizer, nem params, nem model entram no binário genérico do
   struct_path: todos os três carregam referências a recursos nativos
   que não sobrevivem a um restart do BEAM se serializados com
-  :erlang.term_to_binary puro —
-    tokenizer: ponteiro NIF (Rust) pro vocabulário/merges
-    params:    device buffers EXLA (tensores já materializados)
-    model:     o nó de positional_encoding usa Axon.constant/1 com um
-               tensor JÁ CALCULADO (não símbolo) — carrega buffer EXLA
-               junto, mesmo sendo "só a arquitetura"
-
-  model e params são reconstruídos a partir de hyperparams + NxModel.build
-  em load_model/1. tokenizer é reconstruído via BpeTokenizer.load/1.
+  :erlang.term_to_binary puro. Reconstruídos em load_model/1.
   """
   def save_to_disk(%CharacterModel{} = character) do
     File.mkdir_p!(Path.dirname(character.struct_path))
 
-    # weights_binary = Nx.serialize(character.params)
-    # File.write!(character.weights_path, weights_binary)
+    weights_binary = Nx.serialize(character.params)
+    File.write!(character.weights_path, weights_binary)
 
     struct_binary =
       character
